@@ -1,0 +1,252 @@
+"""
+Unique HEM counts by TOPIC_CATEGORY + TOPIC_SUBCATEGORY over the last
+14 complete days (Eastern time), plus the global unique HEM count.
+
+The global count only includes HEMs on topics that map to a valid
+category AND subcategory in the taxonomy.
+
+HEMs with more than OUTLIER_TOPIC_THRESHOLD distinct topics are excluded,
+matching the client job.
+
+How it stays fast:
+- Market Pulse is scanned ONCE.
+- ONE big shuffle: rows are grouped by HEM, collecting each HEM's set of
+  distinct topics (duplicates are collapsed map-side before the shuffle).
+- Everything after that (outlier removal, topic counts, subcategory dedupe,
+  global count) runs within those HEM groups, so the big data never moves again.
+  Only tiny per-topic / per-subcategory counts are shuffled at the end.
+
+Outputs:
+  consumer_last_2_weeks_global_count/run_date=YYYY-MM-DD        (per subcategory)
+    TOPIC_CATEGORY, TOPIC_SUBCATEGORY, unique_hem_count, global_unique_hems_last_14_days
+  consumer_last_2_weeks_global_topic_count/run_date=YYYY-MM-DD  (per topic)
+    topic_id, unique_hem_count, global_unique_hems_last_14_days
+
+Both use the same denominator (global_unique_hems_last_14_days).
+"""
+
+import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from pyspark import StorageLevel
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark import SparkConf
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+
+# ============================================================
+# Settings
+# ============================================================
+
+# Must match OUTLIER_TOPIC_THRESHOLD in the client job
+OUTLIER_TOPIC_THRESHOLD = 500
+
+
+# ============================================================
+# Glue / Spark Setup
+# ============================================================
+
+# Delta requires these two settings when the Spark session is created
+# (they can't be added afterwards).
+spark_conf = (
+    SparkConf()
+    .set("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .set("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+)
+sc = SparkContext.getOrCreate(conf=spark_conf)
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+job.init(args["JOB_NAME"], args)
+
+# Let Spark right-size shuffle partitions and handle skew at runtime
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+# Start with plenty of shuffle partitions (less spilling); AQE merges small ones.
+spark.conf.set("spark.sql.shuffle.partitions", "2000")
+
+
+# ============================================================
+# Paths / Dates
+# ============================================================
+
+TAXO_PATH = "s3a://coop.data.distilled/market_pulse/consumer-taxonomy/consumer_taxo.parquet"
+
+# Must be the SAME table the client job reads (DELTA_BASE_PATH there).
+INPUT_PATH = "s3a://datawarehouse-trovo-untitled-ue1/market_pulse/consumer"
+
+# Last 14 complete days, ending YESTERDAY in Eastern time.
+# Glue's clock is UTC, so date.today() would roll over at 7-8 pm Eastern.
+# Must match the client job.
+LOCAL_TZ = ZoneInfo("America/New_York")
+end_date = datetime.now(LOCAL_TZ).date() - timedelta(days=1)
+start_date = end_date - timedelta(days=13)
+run_date = end_date.strftime("%Y-%m-%d")
+
+OUTPUT_PATH = f"s3a://intent-insights/consumer_last_2_weeks_global_count/run_date={run_date}"
+TOPIC_OUTPUT_PATH = f"s3a://intent-insights/consumer_last_2_weeks_global_topic_count/run_date={run_date}"
+
+date_conditions = []
+d = start_date
+while d <= end_date:
+    date_conditions.append(f"(year = {d.year} AND month = {d.month} AND day = {d.day})")
+    d += timedelta(days=1)
+partition_filter_expr = " OR ".join(date_conditions)
+
+print("=" * 70)
+print(f"14-DAY WINDOW (Eastern): {start_date} to {end_date}   RUN DATE: {run_date}")
+print("=" * 70)
+
+
+# ============================================================
+# Read inputs
+# ============================================================
+
+market_pulse = (
+    spark.read.format("delta").load(INPUT_PATH)
+    .filter(F.expr(partition_filter_expr))          # partition pruning
+    .where(F.col("hem").isNotNull() & F.col("topic_id").isNotNull())
+    .select(F.xxhash64("hem").alias("hem_hash"), "topic_id")
+)
+
+taxonomy = (
+    spark.read.parquet(TAXO_PATH)
+    .select("topic_id", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY")
+    .where(
+        F.col("topic_id").isNotNull()
+        & F.col("TOPIC_CATEGORY").isNotNull()
+        & F.col("TOPIC_SUBCATEGORY").isNotNull()
+    )
+    .dropDuplicates()
+)
+
+# Small lookup: (category, subcategory) -> integer id
+subcats = (
+    taxonomy.select("TOPIC_CATEGORY", "TOPIC_SUBCATEGORY").distinct()
+    .withColumn(
+        "subcat_id",
+        F.row_number().over(Window.orderBy("TOPIC_CATEGORY", "TOPIC_SUBCATEGORY")).cast("int"),
+    )
+    .cache()
+)
+
+# topic_id -> subcat_id (small, broadcast)
+topic_map = (
+    taxonomy.join(subcats, ["TOPIC_CATEGORY", "TOPIC_SUBCATEGORY"])
+    .select("topic_id", "subcat_id")
+)
+
+
+# ============================================================
+# Counts
+# ============================================================
+
+# ------------------------------------------------------------
+# The one big shuffle: one row per HEM with its set of distinct topics.
+# collect_set is partially built on each executor before the shuffle,
+# so repeated (HEM, topic) rows across days collapse early.
+# ------------------------------------------------------------
+per_hem = (
+    market_pulse
+    .groupBy("hem_hash")
+    .agg(F.collect_set("topic_id").alias("topics"))
+    .withColumn("topic_count", F.size("topics"))
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+# ------------------------------------------------------------
+# Outliers (same rule as the client job): > OUTLIER_TOPIC_THRESHOLD distinct
+# topics, mapped or not. Counted here only for the log.
+# ------------------------------------------------------------
+hem_stats = per_hem.agg(
+    F.count("*").alias("hems"),
+    F.sum(F.when(F.col("topic_count") > OUTLIER_TOPIC_THRESHOLD, 1).otherwise(0)).alias("outliers"),
+).collect()[0]
+print(f"HEMS IN WINDOW: {hem_stats['hems']:,}")
+print(f"OUTLIER HEMS DROPPED (> {OUTLIER_TOPIC_THRESHOLD} topics): {hem_stats['outliers']:,}")
+
+# Clean (HEM, topic) pairs. Still grouped by HEM, so no reshuffle below.
+clean = (
+    per_hem
+    .filter(F.col("topic_count") <= OUTLIER_TOPIC_THRESHOLD)
+    .select("hem_hash", F.explode("topics").alias("topic_id"))
+)
+
+# Per-topic reach: pairs are already distinct, so count = distinct HEMs.
+valid_topics = taxonomy.select("topic_id").distinct()
+topic_counts = (
+    clean
+    .join(F.broadcast(valid_topics), "topic_id")
+    .groupBy("topic_id")
+    .agg(F.count("*").alias("unique_hem_count"))
+)
+
+# One row per HEM + subcategory (runs inside the existing HEM grouping)
+hem_subcat = (
+    clean
+    .join(F.broadcast(topic_map), "topic_id")
+    .select("hem_hash", "subcat_id")
+    .dropDuplicates(["hem_hash", "subcat_id"])
+)
+
+# Global: clean HEMs with at least one mapped topic
+global_total = hem_subcat.select("hem_hash").distinct().count()
+
+subcat_counts = (
+    hem_subcat
+    .groupBy("subcat_id")
+    .agg(F.count("*").alias("unique_hem_count"))
+)
+
+print("=" * 70)
+print(f"GLOBAL UNIQUE HEMS: {global_total:,}")
+print("=" * 70)
+
+
+# ============================================================
+# Write (single write, small output -> one file)
+# ============================================================
+
+result = (
+    subcat_counts
+    .join(F.broadcast(subcats), "subcat_id")
+    .withColumn("global_unique_hems_last_14_days", F.lit(global_total))
+    .select(
+        "TOPIC_CATEGORY",
+        "TOPIC_SUBCATEGORY",
+        "unique_hem_count",
+        "global_unique_hems_last_14_days",
+    )
+    .orderBy("TOPIC_CATEGORY", "TOPIC_SUBCATEGORY")
+    .coalesce(1)
+)
+
+result.write.mode("overwrite").parquet(OUTPUT_PATH)
+
+(
+    topic_counts
+    .withColumn("global_unique_hems_last_14_days", F.lit(global_total))
+    .select("topic_id", "unique_hem_count", "global_unique_hems_last_14_days")
+    .orderBy("topic_id")
+    .coalesce(1)
+    .write.mode("overwrite")
+    .parquet(TOPIC_OUTPUT_PATH)
+)
+
+per_hem.unpersist()
+
+print("=" * 70)
+print("✅ DONE")
+print(f"OUTPUT (subcategory): {OUTPUT_PATH}")
+print(f"OUTPUT (topic):       {TOPIC_OUTPUT_PATH}")
+print("=" * 70)
+
+job.commit()
