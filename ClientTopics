@@ -1,0 +1,743 @@
+"""
+Category/subcategory reach for one or more clients' visitors over the last
+14 complete days, compared against the global Market Pulse population.
+
+Definitions (kept consistent with the global job):
+- Reach = distinct HEMs in a TOPIC_CATEGORY + TOPIC_SUBCATEGORY.
+  A HEM on several topics in the same subcategory counts once.
+- Only topics that map to a valid category AND subcategory count.
+- HEMs with more than OUTLIER_TOPIC_THRESHOLD distinct topics (all topics,
+  mapped or not) are excluded as likely bot/pixel/over-tagging noise.
+
+Depends on the global job's output for the same run_date:
+    s3a://intent-insights/consumer_last_2_weeks_global_count/run_date=YYYY-MM-DD
+
+OUTPUT 1 — full counts, one CSV per client, one row per subcategory in the global output
+  client/{client}/category_reach/run_date=YYYY-MM-DD/
+    client_name, TOPIC_CATEGORY, TOPIC_SUBCATEGORY,
+    hem_reach, a            client reach (same value; `a` kept for downstream use)
+    subset_total            distinct clean client HEMs with >= 1 mapped topic
+    b                       global reach for the subcategory
+    global_total            global distinct HEMs (mapped topics)
+    pct_client, pct_global  a / subset_total, b / global_total
+    index                   pct_client / pct_global * 100  (100 = same as population)
+  Subcategories with no client HEMs are included with a = 0.
+
+Scoring (same logic as the original topic scoring pipeline):
+each TOPIC is scored with SCORE_METHOD (client vs. global topic counts), topics
+are ranked, and the top TOP_K topics are kept. Those top topics are then grouped
+by subcategory and category. No topic names are written out.
+
+A subcategory only appears if at least MIN_TOP_TOPICS_PER_SUBCATEGORY of its
+topics made the top-K, so one odd topic can't put it on screen.
+A category appears if (and only if) at least one of its subcategories appears,
+and its numbers use only the topics in those subcategories, so the two
+outputs always match.
+
+OUTPUT 2 — subcategories: client/{client}/subcategory_top/run_date=YYYY-MM-DD/
+    client_name, TOPIC_CATEGORY, TOPIC_SUBCATEGORY,
+    n_top_topics, n_topics_in_group, share_of_topics_in_top,
+    best_topic_rank, avg_score, median_local_lift, pct_more_popular_local,
+    hem_count_local, hem_count_global, subcat_lift,
+    score_method, group_rank, date
+
+OUTPUT 3 — categories: client/{client}/category_top/run_date=YYYY-MM-DD/
+    client_name, TOPIC_CATEGORY,
+    n_subcategories, n_top_topics, n_topics_in_group, share_of_topics_in_top,
+    best_topic_rank, avg_score, median_local_lift, pct_more_popular_local,
+    score_method, group_rank, date
+
+Depends on BOTH global outputs for the same run_date (subcategory and topic).
+"""
+
+import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from functools import reduce
+
+from pyspark import StorageLevel
+from pyspark.sql import DataFrame, functions as F
+from pyspark.sql.window import Window
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark import SparkConf
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+
+# ============================================================
+# Glue / Spark session
+# ============================================================
+
+# Delta requires these two settings when the Spark session is created
+# (they can't be added afterwards).
+spark_conf = (
+    SparkConf()
+    .set("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .set("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+)
+sc_ctx = SparkContext.getOrCreate(conf=spark_conf)
+glueContext = GlueContext(sc_ctx)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+job.init(args["JOB_NAME"], args)
+
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+
+
+# ============================================================
+# Inputs
+# ============================================================
+
+# Client folders in the lead data stream, as "client/subclient=name/".
+CLIENT_SOURCES = [
+    "blumine/subclient=main/",
+    "wbtguns/subclient=wbtguns/",
+    "castleandkey/subclient=main/",
+    "hallowedspirits/subclient=main/",
+    "yachtlogicapps/subclient=main/",
+    "rustytaco/subclient=main/",
+    "skinlyaesthetics/subclient=main/",
+    "passportsandvisas/subclient=main/",
+    "letsstartcoding/subclient=main/",
+    "myadairhomes/subclient=main/",
+    "redrocket/subclient=main/",
+    "redrocketmain/subclient=main/",
+    "rujoboots/subclient=main/",
+]
+
+CLIENTS_PATH_TEMPLATE = (
+    "s3://warehouse.trovo-service.034716930208.us-east-1/"
+    "db/lead_data_stream/unified/client={client}/subclient={subclient}/"
+)
+
+
+def parse_client_source(src: str):
+    """
+    "wbtguns/subclient=wbtguns/" -> ("wbtguns", "wbtguns")
+    "myadairhomes/subclient=main/" -> ("myadairhomes", "main")
+    "myadairhomes" -> ("myadairhomes", "main")
+    """
+    src = src.strip().strip("/")
+    if "/subclient=" in src:
+        client, subclient = src.split("/subclient=", 1)
+    else:
+        client, subclient = src, "main"
+    return client.strip("/"), subclient.strip("/")
+
+
+def clean_client_name(client: str, subclient: str) -> str:
+    """Name used in output paths and the client_name column.
+    'main' (or a subclient equal to the client) is dropped; anything else is appended."""
+    if subclient in ("main", client):
+        return client
+    return f"{client}-{subclient}"
+
+
+# name -> lead data path
+CLIENTS = {}
+for _src in CLIENT_SOURCES:
+    _client, _subclient = parse_client_source(_src)
+    _name = clean_client_name(_client, _subclient)
+    if _name in CLIENTS:
+        raise ValueError(f"Two client sources map to the same output name '{_name}'. Rename one.")
+    CLIENTS[_name] = CLIENTS_PATH_TEMPLATE.format(client=_client, subclient=_subclient)
+
+CLIENT_NAMES = list(CLIENTS)
+
+TAXO_PATH = "s3a://coop.data.distilled/market_pulse/consumer-taxonomy/consumer_taxo.parquet"
+
+# Must be the SAME table the global job reads, or the client is not a true subset.
+DELTA_BASE_PATH = "s3a://datawarehouse-trovo-untitled-ue1/market_pulse/consumer"
+
+GLOBAL_OUTPUT_TEMPLATE = (
+    "s3a://intent-insights/consumer_last_2_weeks_global_count/run_date={date}"
+)
+
+OUTPUT_PATH_TEMPLATE = "s3a://intent-insights/client/{client}/category_reach/run_date={date}/"
+
+OUTLIER_TOPIC_THRESHOLD = 500
+
+GLOBAL_TOPIC_TEMPLATE = (
+    "s3a://intent-insights/consumer_last_2_weeks_global_topic_count/run_date={date}"
+)
+
+SUBCAT_TOP_PATH_TEMPLATE = "s3a://intent-insights/client/{client}/subcategory_top/run_date={date}/"
+CAT_TOP_PATH_TEMPLATE = "s3a://intent-insights/client/{client}/category_top/run_date={date}/"
+
+# ---------------- Scoring ----------------
+# Options: "lift_dampened", "lift_raw", "log_odds", "monroe_z",
+#          "log_odds_lcb", "tfidf", "popularity"
+SCORE_METHOD = "log_odds_lcb"
+
+TOP_K = 1000                        # top-scoring topics kept per client
+MIN_SUPPORT_A = 150                 # minimum client HEMs on a topic for it to be scored
+
+# A subcategory needs at least this many of its topics in the top-K to be shown.
+# A category is shown whenever at least one of its subcategories is shown.
+MIN_TOP_TOPICS_PER_SUBCATEGORY = 2
+
+
+ALPHA = 1.0            # additive smoothing on counts
+GAMMA = 0.25           # dampening exponent for lift_dampened
+Z_CRITICAL = 1.645     # one-sided 95% lower confidence bound (log_odds_lcb)
+
+# Excluded from the ranked output (not from the full counts file)
+EXCLUDED_CATEGORIES = ["Spiritual"]
+EXCLUDED_SUBCATEGORIES = []
+EXCLUDED_TOPICS = []
+
+# ============================================================
+# Dates: last 14 complete days, ending YESTERDAY in Pacific time.
+# Glue's clock is UTC, so date.today() would roll over at 5 pm Pacific.
+# Must match the global job.
+# ============================================================
+
+LOCAL_TZ = ZoneInfo("America/New_York")
+end_date = datetime.now(LOCAL_TZ).date() - timedelta(days=1)
+run_date = end_date.strftime("%Y-%m-%d")
+start_date = end_date - timedelta(days=13)
+
+date_conditions = []
+d = start_date
+while d <= end_date:
+    date_conditions.append(f"(year = {d.year} AND month = {d.month} AND day = {d.day})")
+    d += timedelta(days=1)
+partition_filter_expr = " OR ".join(date_conditions)
+
+print("=" * 70)
+print(f"14-day window: {start_date} to {end_date}   run_date: {run_date}")
+print(f"Clients: {', '.join(CLIENT_NAMES)}")
+print("=" * 70)
+
+
+# ============================================================
+# Global output (must already exist for this run_date)
+# ============================================================
+
+global_path = GLOBAL_OUTPUT_TEMPLATE.format(date=run_date)
+try:
+    global_df = (
+        spark.read.parquet(global_path)
+        .select(
+            "TOPIC_CATEGORY",
+            "TOPIC_SUBCATEGORY",
+            F.col("unique_hem_count").alias("b"),
+            F.col("global_unique_hems_last_14_days").alias("global_total"),
+        )
+        .cache()
+    )
+    global_rows = global_df.count()
+except Exception as e:
+    raise RuntimeError(
+        f"Global output not found at {global_path}. Run the global job for "
+        f"run_date={run_date} first."
+    ) from e
+
+print(f"Global subcategories: {global_rows:,}")
+
+global_topic_path = GLOBAL_TOPIC_TEMPLATE.format(date=run_date)
+try:
+    global_topics = (
+        spark.read.parquet(global_topic_path)
+        .select(
+            "topic_id",
+            F.col("unique_hem_count").alias("b"),
+            F.col("global_unique_hems_last_14_days").alias("global_total"),
+        )
+        .cache()
+    )
+    global_topic_rows = global_topics.count()
+except Exception as e:
+    raise RuntimeError(
+        f"Global topic output not found at {global_topic_path}. Run the global job for "
+        f"run_date={run_date} first."
+    ) from e
+
+print(f"Global topics: {global_topic_rows:,}")
+
+
+# ============================================================
+# Market Pulse (14 days) and taxonomy
+# HEM hashing must match the global job exactly: xxhash64(hem)
+# ============================================================
+
+pairs = (
+    spark.read.format("delta").load(DELTA_BASE_PATH)
+    .filter(F.expr(partition_filter_expr))
+    .where(F.col("hem").isNotNull() & F.col("topic_id").isNotNull())
+    .select(F.xxhash64("hem").alias("hem_hash"), "topic_id")
+)
+
+taxo_raw = spark.read.parquet(TAXO_PATH)
+taxo_valid = taxo_raw.where(
+    F.col("topic_id").isNotNull()
+    & F.col("TOPIC_CATEGORY").isNotNull()
+    & F.col("TOPIC_SUBCATEGORY").isNotNull()
+)
+
+topic_map = (
+    taxo_valid
+    .select("topic_id", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY")
+    .dropDuplicates()
+)
+
+# topic_id -> topic name (only used to apply EXCLUDED_TOPICS)
+topic_names = (
+    taxo_valid.select("topic_id", F.col("TOPIC").alias("topic_name")).dropDuplicates(["topic_id"])
+    if "TOPIC" in taxo_raw.columns
+    else taxo_valid.select("topic_id", F.lit(None).cast("string").alias("topic_name")).dropDuplicates(["topic_id"])
+)
+
+
+# ============================================================
+# All clients' HEMs in one table, so Market Pulse is scanned once
+# ============================================================
+
+def read_client_hems(name: str, path: str) -> DataFrame:
+    return (
+        spark.read.parquet(path)
+        .where(F.col("hem").isNotNull())
+        .select(F.lit(name).alias("client_name"), F.xxhash64("hem").alias("hem_hash"))
+        .distinct()
+    )
+
+client_hems = reduce(
+    DataFrame.unionByName,
+    [read_client_hems(name, path) for name, path in CLIENTS.items()],
+)
+
+# Inner join keeps client_name; a HEM shared by two clients appears once per client.
+# Broadcast is fine up to a few tens of millions of client HEMs (8 bytes each + name).
+client_topics = (
+    pairs
+    .join(F.broadcast(client_hems), "hem_hash")
+    .dropDuplicates(["client_name", "hem_hash", "topic_id"])
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+
+# ============================================================
+# Outliers: > threshold distinct topics (all topics, mapped or not)
+# ============================================================
+
+topics_per_hem = (
+    client_topics
+    .groupBy("client_name", "hem_hash")
+    .agg(F.count("*").alias("topic_count"))
+)
+
+outliers = (
+    topics_per_hem
+    .filter(F.col("topic_count") > OUTLIER_TOPIC_THRESHOLD)
+    .select("client_name", "hem_hash")
+)
+
+# ============================================================
+# Clean, taxonomy-mapped, one row per client + HEM + subcategory
+# ============================================================
+
+# Clean (client, HEM, topic) rows, reused for topic and subcategory counts
+clean_topics = (
+    client_topics
+    .join(outliers, ["client_name", "hem_hash"], "left_anti")
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+mapped = (
+    clean_topics
+    .join(F.broadcast(topic_map), "topic_id")
+    .select("client_name", "hem_hash", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY")
+    .dropDuplicates()
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+# Denominator: clean client HEMs with at least one mapped topic
+subset_totals = mapped.groupBy("client_name").agg(
+    F.countDistinct("hem_hash").alias("subset_total")
+)
+
+reach = mapped.groupBy("client_name", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY").agg(
+    F.count("*").alias("a")
+)
+
+# Per-topic client reach (clean_topics is already one row per client + HEM + topic)
+valid_topic_ids = topic_map.select("topic_id").distinct()
+topic_reach = (
+    clean_topics
+    .join(F.broadcast(valid_topic_ids), "topic_id")
+    .groupBy("client_name", "topic_id")
+    .agg(F.count("*").alias("a"))
+)
+
+
+# ============================================================
+# Logging per client
+# ============================================================
+
+stats = (
+    topics_per_hem.groupBy("client_name")
+    .agg(
+        F.count("*").alias("active_hems"),
+        F.sum(F.when(F.col("topic_count") > OUTLIER_TOPIC_THRESHOLD, 1).otherwise(0)).alias("outliers"),
+    )
+    .join(subset_totals, "client_name", "left")
+    .collect()
+)
+
+for r in stats:
+    print("=" * 70)
+    print(f"Client: {r['client_name']}")
+    print(f"  Active HEMs in window:                 {r['active_hems']:,}")
+    print(f"  Outliers dropped (> {OUTLIER_TOPIC_THRESHOLD} topics):      {r['outliers']:,}")
+    print(f"  subset_total (clean, >=1 mapped topic): {(r['subset_total'] or 0):,}")
+
+# Sanity check: client subcategories should all exist in the global output
+orphans = reach.join(global_df, ["TOPIC_CATEGORY", "TOPIC_SUBCATEGORY"], "left_anti").count()
+if orphans:
+    print(
+        f"WARNING: {orphans:,} client subcategory rows are missing from the global output. "
+        "Check that both jobs read the same Market Pulse table, taxonomy, and date window."
+    )
+
+
+# ============================================================
+# Full counts: every global subcategory x every client, zero-filled
+# ============================================================
+
+clients_df = spark.createDataFrame([(c,) for c in CLIENT_NAMES], ["client_name"])
+
+result = (
+    clients_df.crossJoin(global_df)
+    .join(reach, ["client_name", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY"], "left")
+    .join(subset_totals, "client_name", "left")
+    .fillna(0, subset=["a", "subset_total"])
+    .withColumn("hem_reach", F.col("a"))
+    .withColumn(
+        "pct_client",
+        F.when(F.col("subset_total") > 0, F.col("a") / F.col("subset_total")),
+    )
+    .withColumn(
+        "pct_global",
+        F.when(F.col("global_total") > 0, F.col("b") / F.col("global_total")),
+    )
+    .withColumn(
+        "index",
+        F.when(F.col("pct_global") > 0, F.round(F.col("pct_client") / F.col("pct_global") * 100, 2)),
+    )
+    .select(
+        "client_name", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY",
+        "hem_reach", "a", "subset_total",
+        "b", "global_total",
+        "pct_client", "pct_global", "index",
+    )
+    .cache()
+)
+
+
+# ============================================================
+# Scoring methods
+# st = client denominator (subset_total), gt = global denominator (global_total)
+# pa, pb = smoothed client / global prevalence
+# ============================================================
+
+alpha = F.lit(float(ALPHA))
+gamma = F.lit(float(GAMMA))
+eps = F.lit(1e-12)
+z_critical = F.lit(float(Z_CRITICAL))
+
+st = F.col("subset_total")
+gt = F.col("global_total")
+
+
+def _clamp(col):
+    return F.least(F.greatest(col, eps), 1 - eps)
+
+
+def _logit_diff(df):
+    return (
+        df
+        .withColumn("pa", _clamp(F.col("pa")))
+        .withColumn("pb", _clamp(F.col("pb")))
+        .withColumn(
+            "log_odds",
+            F.log(F.col("pa") / (1 - F.col("pa"))) - F.log(F.col("pb") / (1 - F.col("pb"))),
+        )
+    )
+
+
+def _log_odds_and_variance(df):
+    return (
+        _logit_diff(df)
+        .withColumn(
+            "var",
+            1 / (F.col("a") + alpha)
+            + 1 / (st - F.col("a") + alpha)
+            + 1 / (F.col("b") + alpha)
+            + 1 / (gt - F.col("b") + alpha),
+        )
+        .filter(F.col("log_odds").isNotNull() & ~F.isnan("log_odds"))
+    )
+
+
+def score_lift_dampened(df):
+    return (
+        df.withColumn("log_lift", F.log(F.col("pa") / F.pow(F.col("pb"), gamma)))
+        .withColumn("score", F.col("log_lift") * F.log1p(F.col("a")))
+    )
+
+
+def score_lift_raw(df):
+    return (
+        df.withColumn("log_lift", F.log(F.col("pa") / F.col("pb")))
+        .withColumn("score", F.col("log_lift") * F.log1p(F.col("a")))
+    )
+
+
+def score_log_odds(df):
+    df = _logit_diff(df)
+    return df.withColumn("log_lift", F.col("log_odds")).withColumn("score", F.col("log_odds"))
+
+
+def score_monroe_z(df):
+    df = _log_odds_and_variance(df).withColumn("z_score", F.col("log_odds") / F.sqrt(F.col("var")))
+    df = df.filter(F.col("z_score").isNotNull() & ~F.isnan("z_score"))
+    return df.withColumn("log_lift", F.col("log_odds")).withColumn("score", F.col("z_score"))
+
+
+def score_log_odds_lcb(df):
+    df = _log_odds_and_variance(df).withColumn("se", F.sqrt(F.col("var")))
+    return (
+        df.withColumn("log_lift", F.col("log_odds"))
+        .withColumn("score", F.col("log_odds") - z_critical * F.col("se"))
+    )
+
+
+def score_tfidf(df):
+    df = df.withColumn("idf", F.log((gt + 1) / (F.col("b") + 1)))
+    return df.withColumn("log_lift", F.col("idf")).withColumn("score", F.col("pa") * F.col("idf"))
+
+
+def score_popularity(df):
+    return df.withColumn("log_lift", F.lit(None).cast("double")).withColumn("score", F.col("a"))
+
+
+SCORE_METHODS = {
+    "lift_dampened": score_lift_dampened,
+    "lift_raw": score_lift_raw,
+    "log_odds": score_log_odds,
+    "monroe_z": score_monroe_z,
+    "log_odds_lcb": score_log_odds_lcb,
+    "tfidf": score_tfidf,
+    "popularity": score_popularity,
+}
+
+if SCORE_METHOD not in SCORE_METHODS:
+    raise ValueError(f"Unknown SCORE_METHOD '{SCORE_METHOD}'. Options: {list(SCORE_METHODS)}")
+
+
+# ============================================================
+# Score each TOPIC
+# ============================================================
+
+base_scored = (
+    topic_reach
+    .join(global_topics, "topic_id")
+    .join(subset_totals, "client_name")
+    .join(F.broadcast(topic_names), "topic_id", "left")
+    .filter(~F.coalesce(F.col("topic_name").isin(EXCLUDED_TOPICS), F.lit(False)))
+    .withColumn("a", F.col("a").cast("double"))
+    .withColumn("b", F.col("b").cast("double"))
+    .withColumn("subset_total", F.col("subset_total").cast("double"))
+    .withColumn("global_total", F.col("global_total").cast("double"))
+    .filter(F.col("subset_total") > 0)
+    .filter(F.col("a") >= F.lit(MIN_SUPPORT_A))
+    .withColumn("pa", (F.col("a") + alpha) / (st + 2 * alpha))
+    .withColumn("pb", (F.col("b") + alpha) / (gt + 2 * alpha))
+)
+
+scored_topics = (
+    SCORE_METHODS[SCORE_METHOD](base_scored)
+    .withColumn("topic_lift", F.col("pa") / F.col("pb"))
+    # A topic can sit in more than one subcategory; it counts toward each.
+    .join(F.broadcast(topic_map), "topic_id")
+    .filter(~F.col("TOPIC_CATEGORY").isin(EXCLUDED_CATEGORIES))
+    .filter(~F.col("TOPIC_SUBCATEGORY").isin(EXCLUDED_SUBCATEGORIES))
+    .select("client_name", "topic_id", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY",
+            "a", "score", "topic_lift")
+    .cache()
+)
+
+
+# ============================================================
+# Rank topics and keep the top-K per client
+# ============================================================
+
+w_rank = Window.partitionBy("client_name").orderBy(F.desc("score"), F.desc("a"))
+
+top_topics = (
+    scored_topics
+    .withColumn("rank", F.dense_rank().over(w_rank))
+    .filter(F.col("rank") <= F.lit(TOP_K))
+    .cache()
+)
+
+
+# ============================================================
+# Group the top-K topics by subcategory and category
+# ============================================================
+
+def _median(col):
+    return F.percentile_approx(col, 0.5, 10000)
+
+
+subcat_sizes = (
+    topic_map.groupBy("TOPIC_CATEGORY", "TOPIC_SUBCATEGORY")
+    .agg(F.countDistinct("topic_id").alias("n_topics_in_group"))
+)
+category_sizes = (
+    topic_map.groupBy("TOPIC_CATEGORY")
+    .agg(F.countDistinct("topic_id").alias("n_topics_in_group"))
+)
+
+
+def rollup(df, group_cols, sizes, min_topics):
+    # Rank by the group's best topic (rank 1 = the client's #1 topic),
+    # ties broken by more top topics, then higher average score.
+    w = Window.partitionBy("client_name").orderBy(
+        F.asc("best_topic_rank"), F.desc("n_top_topics"), F.desc("avg_score")
+    )
+    return (
+        df.groupBy("client_name", *group_cols)
+        .agg(
+            F.countDistinct("topic_id").alias("n_top_topics"),
+            F.min("rank").alias("best_topic_rank"),
+            F.avg("score").alias("avg_score"),
+            _median("topic_lift").alias("median_local_lift"),
+        )
+        .filter(F.col("n_top_topics") >= F.lit(min_topics))
+        .join(F.broadcast(sizes), group_cols, "left")
+        .withColumn("share_of_topics_in_top", F.col("n_top_topics") / F.col("n_topics_in_group"))
+        .withColumn("pct_more_popular_local", (F.col("median_local_lift") - 1.0) * 100.0)
+        .withColumn("group_rank", F.dense_rank().over(w))
+        .withColumn("score_method", F.lit(SCORE_METHOD))
+        .withColumn("date", F.lit(run_date))
+    )
+
+
+subcat_top = (
+    rollup(top_topics, ["TOPIC_CATEGORY", "TOPIC_SUBCATEGORY"], subcat_sizes,
+           MIN_TOP_TOPICS_PER_SUBCATEGORY)
+    # Subcategory-level counts for readability
+    .join(
+        result.select(
+            "client_name", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY",
+            F.col("a").alias("hem_count_local"),
+            F.col("b").alias("hem_count_global"),
+            (F.col("index") / 100).alias("subcat_lift"),
+        ),
+        ["client_name", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY"],
+        "left",
+    )
+    .select(
+        "client_name", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY",
+        "n_top_topics", "n_topics_in_group", "share_of_topics_in_top",
+        "best_topic_rank", "avg_score", "median_local_lift", "pct_more_popular_local",
+        "hem_count_local", "hem_count_global", "subcat_lift",
+        "score_method", "group_rank", "date",
+    )
+    .cache()
+)
+
+# Categories are built only from the subcategories shown above,
+# so every subcategory's category appears and the numbers line up.
+shown_subcats = subcat_top.select("client_name", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY")
+
+n_subcats = shown_subcats.groupBy("client_name", "TOPIC_CATEGORY").agg(
+    F.count("*").alias("n_subcategories")
+)
+
+cat_top = (
+    rollup(
+        top_topics.join(shown_subcats, ["client_name", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY"]),
+        ["TOPIC_CATEGORY"],
+        category_sizes,
+        1,
+    )
+    .join(n_subcats, ["client_name", "TOPIC_CATEGORY"])
+    .select(
+        "client_name", "TOPIC_CATEGORY",
+        "n_subcategories", "n_top_topics", "n_topics_in_group", "share_of_topics_in_top",
+        "best_topic_rank", "avg_score", "median_local_lift", "pct_more_popular_local",
+        "score_method", "group_rank", "date",
+    )
+    .cache()
+)
+
+
+# ============================================================
+# Log the top of each client's rankings
+# ============================================================
+
+for client in CLIENT_NAMES:
+    n_top = top_topics.filter(F.col("client_name") == client).select("topic_id").distinct().count()
+    print("=" * 70)
+    print(f"RANKING: {client}   method={SCORE_METHOD}   top topics kept={n_top:,}")
+    print("  Top subcategories:")
+    (
+        subcat_top.filter(F.col("client_name") == client).orderBy("group_rank")
+        .select("group_rank", "TOPIC_CATEGORY", "TOPIC_SUBCATEGORY",
+                "n_top_topics", "best_topic_rank", "median_local_lift", "avg_score")
+        .show(15, truncate=35)
+    )
+    print("  Top categories:")
+    (
+        cat_top.filter(F.col("client_name") == client).orderBy("group_rank")
+        .select("group_rank", "TOPIC_CATEGORY", "n_subcategories", "n_top_topics",
+                "best_topic_rank", "median_local_lift", "avg_score")
+        .show(10, truncate=35)
+    )
+
+
+# ============================================================
+# Write per client
+# ============================================================
+
+def write_csv(df, path, quote_all=False):
+    w = df.coalesce(1).write.mode("overwrite").option("header", "true")
+    if quote_all:
+        w = w.option("quoteAll", "true")
+    w.csv(path)
+
+
+for client in CLIENT_NAMES:
+    output_path = OUTPUT_PATH_TEMPLATE.format(client=client, date=run_date)
+    write_csv(
+        result.filter(F.col("client_name") == client)
+        .orderBy(F.col("index").desc_nulls_last(), F.col("a").desc()),
+        output_path,
+    )
+    print(f"Wrote full subcategory counts: {output_path}")
+
+    subcat_path = SUBCAT_TOP_PATH_TEMPLATE.format(client=client, date=run_date)
+    write_csv(subcat_top.filter(F.col("client_name") == client).orderBy("group_rank"), subcat_path, True)
+    print(f"Wrote subcategories (>= {MIN_TOP_TOPICS_PER_SUBCATEGORY} of top-{TOP_K} topics): {subcat_path}")
+
+    cat_path = CAT_TOP_PATH_TEMPLATE.format(client=client, date=run_date)
+    write_csv(cat_top.filter(F.col("client_name") == client).orderBy("group_rank"), cat_path, True)
+    print(f"Wrote categories (those with >= 1 subcategory shown): {cat_path}")
+
+
+# ============================================================
+# Cleanup / commit
+# ============================================================
+
+for df in [subcat_top, cat_top, top_topics, scored_topics, result, mapped,
+           clean_topics, client_topics, global_df, global_topics]:
+    df.unpersist()
+
+job.commit()
